@@ -3,15 +3,18 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 32  # how many independent sequences will we process in parallel?
-block_size = 8  # what is the maximum context length for predictions?
+batch_size = 64  # how many independent sequences will we process in parallel?
+block_size = 256  # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 500
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32  # size of embedding/feature vector
-# --------------------
+n_embd = 384  # size of embedding/feature vector
+n_head = 6
+n_layer = 6
+dropout = 0.2
+# -----------
 
 torch.manual_seed(1337)
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -79,6 +82,7 @@ class Head(nn.Module):
         # not a parameter of the module, buffer instead
         self.register_buffer('tril', torch.tril(
             torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -88,6 +92,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5  # (B,T,C) @ (B,C,T) -> (B,T,T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
         wei = F.softmax(wei, dim=-1)  # (B,T,T)
+        wei = self.dropout(wei)
         # perform the weighted aggregation of the values
         v = self.value(x)  # (B,T,C)
         out = wei @ v  # (B,T,T) @ (B,T,C) -> (B,T,C)
@@ -104,7 +109,9 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        # projection is a linear transformation of self attention outcome
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -118,8 +125,10 @@ class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -140,10 +149,14 @@ class Block(nn.Module):
         self.sa = MultiHeadAttention(n_head, head_size)
         # computation
         self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(x)
-        x = x + self.ffwd(x)
+        # residual connection adding x
+        # layer norm added before s.a and ffwd
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 
@@ -156,10 +169,7 @@ class BigramLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
 
         self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-        )
+            *[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         # from token embeddings to logits
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
@@ -170,8 +180,7 @@ class BigramLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(
             torch.arange(T, device=device))  # (T,C)
         x = token_emb + pos_emb
-        x = self.sa_heads(x)  # apply one head of self-attention (B,T,C)
-        x = self.ffwd(x)
+        x = self.blocks(x)
         logits = self.lm_head(x)  # (B,T,vocab_size)
 
         if targets is None:
@@ -204,6 +213,9 @@ class BigramLanguageModel(nn.Module):
 
 model = BigramLanguageModel()
 m = model.to(device)
+
+# print number of parameters
+print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
